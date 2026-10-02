@@ -16,6 +16,7 @@ from toyota_na.vehicle.entity_types.ToyotaNumeric import ToyotaNumeric
 from toyota_na.vehicle.entity_types.ToyotaOpening import ToyotaOpening
 from toyota_na.vehicle.entity_types.ToyotaRemoteStart import ToyotaRemoteStart
 
+from .patch_client import RemoteCommandNeedsAutoFix
 from .vehicle_helpers import (
     backdoor_candidates,
     can_extend_remote_runtime,
@@ -344,6 +345,46 @@ class SeventeenCYPlusToyotaVehicle(ToyotaVehicle):
         except Exception as e:
             _LOGGER.debug("Error refreshing electric status: %s", e)
 
+    @property
+    def can_wake(self) -> bool:
+        """AppSync vehicles accept the account wake Toyota's app sends on open."""
+        return self.uses_appsync and self.subscribed and self.feature_enabled("remoteCommands")
+
+    async def wake(self) -> None:
+        """Wake the vehicle's telematics unit without requesting a status report."""
+        await self._client.wake_vehicles(self._region)
+
+    def remote_autofix_commands(self, *, assume_open: bool = False) -> list[str]:
+        """Mirror the lock/close fixes Toyota's app sends with a remote start.
+
+        With assume_open, unknown openings count as needing a fix, matching the
+        app's handling of a missing window count after Toyota asks for fixes.
+        """
+        if not self.feature_enabled("remoteAutoFix", default=False):
+            return []
+        needs_fix = (lambda value: value is not True) if assume_open else (lambda value: value is False)
+
+        def opening(feature, attribute):
+            value = self._features.get(feature)
+            return getattr(value, attribute, None) if isinstance(value, ToyotaOpening) else None
+
+        fixes = []
+        if any(
+            needs_fix(opening(feature, "locked"))
+            for feature in self._graphql_door_map.values()
+        ):
+            fixes.append("door-lock")
+        if self.supports_command(RemoteRequestCommand.WindowsClose) and any(
+            needs_fix(opening(feature, "closed"))
+            for feature in self._graphql_window_map.values()
+        ):
+            fixes.append("power-window-close")
+        if self.supports_command(RemoteRequestCommand.MoonroofClose) and needs_fix(
+            opening(VehicleFeatures.Moonroof, "closed")
+        ):
+            fixes.append("sunroof-close")
+        return fixes
+
     async def send_command(self, command: RemoteRequestCommand) -> None:
         """Send a generation-appropriate remote command."""
         if command == RemoteRequestCommand.ExtendRuntime and self.supports_command(command):
@@ -368,9 +409,30 @@ class SeventeenCYPlusToyotaVehicle(ToyotaVehicle):
             return
         command_name = self._command_map[command]
         if self.uses_appsync:
-            await self._client.remote_request_24mm(
-                self._vin, command_name, self._region
-            )
+            if command != RemoteRequestCommand.EngineStart:
+                await self._client.remote_request_24mm(
+                    self._vin, command_name, self._region
+                )
+                return
+            fixes = self.remote_autofix_commands()
+            try:
+                await self._client.remote_request_24mm(
+                    self._vin, command_name, self._region, autofix_commands=fixes,
+                )
+            except RemoteCommandNeedsAutoFix:
+                # Toyota refused to start without the app's lock/close popup.
+                # Re-read the vehicle and send once more with what still needs fixing.
+                status = await self._client.graphql_get_vehicle_status(
+                    self.vin, self.backdoor_type, self.region,
+                )
+                if status:
+                    self.apply_graphql_status(status)
+                retry = self.remote_autofix_commands(assume_open=True)
+                if retry == fixes:
+                    raise
+                await self._client.remote_request_24mm(
+                    self._vin, command_name, self._region, autofix_commands=retry,
+                )
             return
         if self._generation == ApiVehicleGeneration.MM21:
             await self._client.remote_request_21mm(

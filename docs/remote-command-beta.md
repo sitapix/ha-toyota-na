@@ -46,6 +46,25 @@ The wire command remains `engine-start` for supported 24MM vehicles; there is
 no speculative switch to climate-start. An engine-running sensor alone cannot
 prove a remote-start session.
 
+## Matching Toyota's app (2.10.0b5.post2)
+
+Traced from the decompiled Toyota app 3.5.0 (`com.toyota.oneapp`):
+
+- The app wakes the vehicle with `POST /v1/remote/route/wake` when it opens
+  and every five minutes while in use, never with the GraphQL `postPreWake`
+  this integration used. Vehicle commands now send that wake, wait a few
+  seconds, then submit. A **Wake Vehicle** button sends the same wake so a
+  dashboard can warm the vehicle up when it is opened.
+- The app accepts any `onPostRemoteCallback` for the VIN; its `appRequestNo`
+  is not the submission's `requestNo`. Remote commands no longer drop
+  callbacks whose request number differs. Charge-schedule writes, whose
+  numbers do match, keep matching.
+- On vehicles with the `remoteAutoFix` feature, engine start carries the
+  app's auto-fix list: `door-lock` when a door is unlocked,
+  `power-window-close` and `sunroof-close` when an opening is open and the
+  vehicle supports closing it. When Toyota answers `popup_required`, the
+  integration re-reads the vehicle and retries once with any new fixes.
+
 ## Validation and remaining uncertainty
 
 The offline suite uses synthetic protocol responses and Home Assistant stubs.

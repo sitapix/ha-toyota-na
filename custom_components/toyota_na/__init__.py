@@ -56,6 +56,7 @@ from .patch_client import (
     graphql_get_vehicle_status,
     graphql_send_remote_command,
     remote_request_24mm,
+    wake_vehicles,
 )
 ToyotaOneClient.get_electric_realtime_status = get_electric_realtime_status
 ToyotaOneClient.get_electric_status = get_electric_status
@@ -93,6 +94,7 @@ ToyotaOneClient.graphql_refresh_status = graphql_refresh_status
 ToyotaOneClient.graphql_get_vehicle_status = graphql_get_vehicle_status
 ToyotaOneClient.graphql_send_remote_command = graphql_send_remote_command
 ToyotaOneClient.remote_request_24mm = remote_request_24mm
+ToyotaOneClient.wake_vehicles = wake_vehicles
 
 # Patch base_vehicle
 import toyota_na.vehicle.base_vehicle

@@ -3,11 +3,15 @@
 import asyncio
 import json
 import unittest
+from copy import deepcopy
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import test_appsync_transport as transport
 import test_button as ha
 from custom_components.toyota_na import patch_client as client
+client.WAKE_SETTLE_SECONDS = 0
+from custom_components.toyota_na.patch_base_vehicle import RemoteRequestCommand as client_commands
 import test_service_errors as services
 
 
@@ -139,7 +143,6 @@ class RemoteOutcomeTests(unittest.IsolatedAsyncioTestCase):
         trace = toyota._remote_command_history[-1]
         self.assertEqual("completed", trace["outcome"])
         self.assertIn("ignored_vehicle", [e["event"] for e in trace["events"]])
-        self.assertIn("ignored_request_number", [e["event"] for e in trace["events"]])
         for value in (json.dumps(trace), " ".join(logs.output)):
             self.assertNotIn("private", value)
             self.assertNotIn("TESTVIN24", value)
@@ -213,7 +216,7 @@ class ReachabilityTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_failed_pre_wake_still_sends_command_once(self):
         toyota = transport._CommandClient()
-        toyota.graphql_pre_wake = AsyncMock(side_effect=RuntimeError("asleep"))
+        toyota.api_post = AsyncMock(side_effect=RuntimeError("asleep"))
         with patch.object(client, "_wait_for_remote_command_result", AsyncMock(return_value={})):
             await self.send(toyota, "engine-start")
         self.assertEqual(["engine-start"], toyota.calls)
@@ -221,7 +224,7 @@ class ReachabilityTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_auth_failure_during_pre_wake_sends_nothing(self):
         toyota = transport._CommandClient()
-        toyota.graphql_pre_wake = AsyncMock(side_effect=client.AuthError("expired"))
+        toyota.api_post = AsyncMock(side_effect=client.AuthError("expired"))
         with self.assertRaises(client.AuthError):
             await self.send(toyota, "engine-start")
         self.assertEqual([], toyota.command_calls)
@@ -279,6 +282,113 @@ class SubmissionErrorTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "correlation ID"):
             client._require_remote_execution("SUCCESS")
 
+
+
+def _opening(position=None, lock=None):
+    return {
+        **({"position": {"status": position}} if position else {}),
+        **({"lock": {"status": lock}} if lock else {}),
+    }
+
+
+class AutoFixTests(unittest.IsolatedAsyncioTestCase):
+    """Engine start mirrors the lock/close fixes Toyota's app sends."""
+
+    async def make(self, *, auto_fix=True):
+        import test_vehicle_behavior as behavior
+        from custom_components.toyota_na.patch_vehicle import get_vehicles
+
+        metadata = {**deepcopy(behavior.TWENTY_FOUR_MM_PHEV), "vin": "SYNTHETIC24MM"}
+        toyota = SimpleNamespace(
+            get_user_vehicle_list=AsyncMock(return_value=[metadata]),
+            get_telemetry=AsyncMock(return_value={}),
+            graphql_get_vehicle_status=AsyncMock(return_value={}),
+            remote_request_24mm=AsyncMock(),
+            wake_vehicles=AsyncMock(),
+            graphql_pre_wake=AsyncMock(), graphql_confirm_subscription=AsyncMock(),
+            graphql_refresh_status=AsyncMock(),
+            auth=SimpleNamespace(get_guid=AsyncMock(return_value="guid")),
+        )
+        vehicle, = await get_vehicles(toyota)
+        vehicle._feature_flags = {
+            **(vehicle._feature_flags or {}), "remoteCommands": 1, "remoteAutoFix": int(auto_fix),
+        }
+        return vehicle, toyota
+
+    @staticmethod
+    def status(door_lock="locked", window="closed", moonroof="closed"):
+        return {"vehicleState": {
+            "doors": {"driverSide": _opening("closed", door_lock)},
+            "windows": {"driverSide": _opening(window)},
+            "moonroof": _opening(moonroof),
+        }}
+
+    async def test_unlocked_doors_are_locked_with_engine_start(self):
+        vehicle, toyota = await self.make()
+        vehicle.apply_graphql_status(self.status(door_lock="unlocked"))
+        await vehicle.send_command(client_commands.EngineStart)
+        toyota.remote_request_24mm.assert_awaited_once_with(
+            vehicle.vin, "engine-start", vehicle.region, autofix_commands=["door-lock"],
+        )
+
+    async def test_closed_secure_vehicle_sends_no_fixes(self):
+        vehicle, toyota = await self.make()
+        vehicle.apply_graphql_status(self.status())
+        self.assertEqual([], vehicle.remote_autofix_commands())
+
+    async def test_windows_and_moonroof_need_their_capabilities(self):
+        vehicle, _ = await self.make()
+        vehicle.apply_graphql_status(self.status(window="open", moonroof="open"))
+        with patch.object(type(vehicle), "supports_command", lambda self, command: True):
+            self.assertEqual(
+                ["power-window-close", "sunroof-close"], vehicle.remote_autofix_commands(),
+            )
+        with patch.object(type(vehicle), "supports_command", lambda self, command: False):
+            self.assertEqual([], vehicle.remote_autofix_commands())
+
+    async def test_vehicles_without_auto_fix_send_none(self):
+        vehicle, _ = await self.make(auto_fix=False)
+        vehicle.apply_graphql_status(self.status(door_lock="unlocked"))
+        self.assertEqual([], vehicle.remote_autofix_commands())
+
+    async def test_other_commands_never_carry_fixes(self):
+        vehicle, toyota = await self.make()
+        vehicle.apply_graphql_status(self.status(door_lock="unlocked"))
+        await vehicle.send_command(client_commands.DoorUnlock)
+        toyota.remote_request_24mm.assert_awaited_once_with(vehicle.vin, "door-unlock", vehicle.region)
+
+    async def test_popup_request_retries_once_with_fresh_fixes(self):
+        vehicle, toyota = await self.make()
+        vehicle.apply_graphql_status(self.status())
+        toyota.remote_request_24mm.side_effect = [client.RemoteCommandNeedsAutoFix("lock first"), None]
+        toyota.graphql_get_vehicle_status.return_value = self.status(door_lock="unlocked")
+        await vehicle.send_command(client_commands.EngineStart)
+        self.assertEqual(
+            [[], ["door-lock"]],
+            [call.kwargs["autofix_commands"] for call in toyota.remote_request_24mm.await_args_list],
+        )
+
+    async def test_popup_request_without_a_new_fix_is_not_resent(self):
+        vehicle, toyota = await self.make()
+        vehicle.apply_graphql_status(self.status(door_lock="unlocked"))
+        toyota.remote_request_24mm.side_effect = client.RemoteCommandNeedsAutoFix("lock first")
+        toyota.graphql_get_vehicle_status.return_value = self.status(door_lock="unlocked")
+        with self.assertRaises(client.RemoteCommandNeedsAutoFix):
+            await vehicle.send_command(client_commands.EngineStart)
+        toyota.remote_request_24mm.assert_awaited_once()
+
+    async def test_wake_uses_the_account_wake(self):
+        vehicle, toyota = await self.make()
+        self.assertTrue(vehicle.can_wake)
+        await vehicle.wake()
+        toyota.wake_vehicles.assert_awaited_once_with(vehicle.region)
+
+    async def test_wake_request_matches_toyota_app(self):
+        toyota = SimpleNamespace(api_post=AsyncMock())
+        await client.wake_vehicles(toyota, "US")
+        toyota.api_post.assert_awaited_once_with(
+            "https://onecdn.telematicsct.com/v1/remote/route/wake", None, {"x-region": "US"},
+        )
 
 class UncertainServiceTests(services.CommandServiceErrorTests):
     async def test_followup_read_is_cancelled_on_integration_unload(self):

@@ -29,6 +29,13 @@ _LOGGER = logging.getLogger(__name__)
 REMOTE_COMMAND_TIMEOUT = 60
 # A sleeping vehicle can take about two minutes to act on a command.
 VEHICLE_COMMAND_TIMEOUT = 180
+# Toyota's app wakes the vehicle on open and waits two seconds before a command.
+WAKE_SETTLE_SECONDS = 5
+REMOTE_AUTOFIX_COMMANDS = ("door-lock", "power-window-close", "sunroof-close")
+AUTOFIX_REQUIRED = (
+    "Toyota needs the RAV4 locked with its windows and moonroof closed before "
+    "remote start."
+)
 CHARGE_COMMANDS = (
     "immediate-charge", "resume-charge", "charge-stop", "power-supply-stop",
 )
@@ -44,6 +51,10 @@ class RemoteCommandOutcomeUnknown(RuntimeError):
 
 class RemoteCommandRejected(RuntimeError):
     """Toyota explicitly rejected a command."""
+
+
+class RemoteCommandNeedsAutoFix(RemoteCommandRejected):
+    """Toyota asked to lock or close the vehicle before running the command."""
 
 
 def _safe_result_code(value):
@@ -979,13 +990,13 @@ async def graphql_get_vehicle_status(
 
 
 async def graphql_send_remote_command(
-    self, vin, command, region="US"
+    self, vin, command, region="US", autofix_commands=()
 ):
     """Submit an AppSync command after its callback subscription is ready."""
     data = await self.graphql_request(
         "SendRemoteCommand",
         GRAPHQL_SEND_REMOTE_COMMAND,
-        {"command": command, "autoFixCommands": []},
+        {"command": command, "autoFixCommands": list(autofix_commands)},
         vin=vin,
         region=region,
         raise_errors=True,
@@ -1130,6 +1141,8 @@ async def _wait_for_remote_command_result(
             return callback
         if status == "in_progress":
             continue
+        if status == "popup_required":
+            raise RemoteCommandNeedsAutoFix(AUTOFIX_REQUIRED)
         if fail_on_unknown or status in ("error", "timeout") or callback.get("commandEnded") is True:
             raise RemoteCommandRejected(
                 detail
@@ -1138,13 +1151,19 @@ async def _wait_for_remote_command_result(
     raise RemoteCommandOutcomeUnknown(REMOTE_COMMAND_UNKNOWN)
 
 
-async def remote_request_24mm(self, vin, command, region="US"):
+async def remote_request_24mm(self, vin, command, region="US", autofix_commands=()):
     """Run an AppSync command and await Toyota's callback."""
     vehicle_command = command not in CHARGE_COMMANDS
+    autofix_commands = [c for c in autofix_commands if c in REMOTE_AUTOFIX_COMMANDS]
 
     async def submit():
         if vehicle_command:
             await _pre_wake_for_command(self, vin, region)
+        _trace_event(_active_command_trace(self, vin), "autofix", commands=autofix_commands)
+        if autofix_commands:
+            return await self.graphql_send_remote_command(
+                vin, command, region, autofix_commands=autofix_commands,
+            )
         return await self.graphql_send_remote_command(vin, command, region)
 
     return await _run_appsync_operation(
@@ -1152,21 +1171,30 @@ async def remote_request_24mm(self, vin, command, region="US"):
         fail_on_unknown=vehicle_command,
         command=command,
         timeout=VEHICLE_COMMAND_TIMEOUT if vehicle_command else None,
+        # Toyota's app matches remote-command callbacks by VIN only: their
+        # appRequestNo is not the submission's requestNo.
+        match_request_no=False,
     )
 
 
+async def wake_vehicles(self, region="US"):
+    """Wake the account's vehicles the way Toyota's app does when it opens."""
+    return await self.api_post(REMOTE_ROUTE + "wake", None, {"x-region": region})
+
+
 async def _pre_wake_for_command(self, vin, region):
-    """Wake the telematics unit like Refresh does; the command is sent either way."""
+    """Wake the telematics unit like Toyota's app; the command is sent either way."""
     trace = _active_command_trace(self, vin)
     try:
-        await self.graphql_pre_wake(await self.auth.get_guid(), region)
+        await wake_vehicles(self, region)
     except (AuthError, asyncio.CancelledError):
         raise
     except Exception as err:
         _trace_event(trace, "pre_wake_failed")
-        _LOGGER.debug("Pre-wake before remote command failed: %s", type(err).__name__)
+        _LOGGER.debug("Wake before remote command failed: %s", type(err).__name__)
     else:
         _trace_event(trace, "pre_wake_sent")
+        await asyncio.sleep(WAKE_SETTLE_SECONDS)
 
 
 async def update_charge_settings(self, vin, variable, value, region="US"):
@@ -1255,6 +1283,7 @@ async def save_climate_schedule(self, vin, generation, schedule, region="US", br
 
 async def _run_appsync_operation(
     self, vin, submit, region, *, fail_on_unknown=False, command=None, timeout=None,
+    match_request_no=True,
 ):
     # Callbacks can omit request numbers, so serialize this account's
     # operations for each vehicle.
@@ -1282,7 +1311,7 @@ async def _run_appsync_operation(
         try:
             result = await _execute_appsync_operation(
                 self, vin, submit, region, fail_on_unknown=fail_on_unknown, trace=trace,
-                timeout=timeout,
+                timeout=timeout, match_request_no=match_request_no,
             )
             trace["outcome"] = "completed"
             return result
@@ -1306,6 +1335,7 @@ async def _run_appsync_operation(
 
 async def _execute_appsync_operation(
     self, vin, submit, region, *, fail_on_unknown=False, trace=None, timeout=None,
+    match_request_no=True,
 ):
     token = await self.auth.get_access_token()
     guid = await self.auth.get_guid()
@@ -1371,6 +1401,8 @@ async def _execute_appsync_operation(
             request_no = ((execution or {}).get("payload") or {}).get(
                 "requestNo"
             )
+            if not match_request_no:
+                request_no = None
             try:
                 return await _wait_for_remote_command_result(
                     ws, vin, subscription_id, request_no, fail_on_unknown=fail_on_unknown, trace=trace,

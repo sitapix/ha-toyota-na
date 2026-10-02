@@ -8,5 +8,5 @@
     "iot_class": "cloud_polling",
     "issue_tracker": "https://github.com/sitapix/ha-toyota-na/issues",
     "requirements": ["toyota-na==2.1.1"],
-    "version": "2.10.0b5.post1"
+    "version": "2.10.0b5.post2"
 }

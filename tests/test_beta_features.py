@@ -74,7 +74,9 @@ class FeatureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(vehicle.endpoint_generation, "17CYPLUS")
         client.graphql_get_vehicle_status.assert_awaited_once_with("SYNTHETIC26BEV", "hatch", "CA")
         await vehicle.send_command(RemoteRequestCommand.EngineStart)
-        client.remote_request_24mm.assert_awaited_once_with("SYNTHETIC26BEV", "engine-start", "CA")
+        client.remote_request_24mm.assert_awaited_once_with(
+            "SYNTHETIC26BEV", "engine-start", "CA", autofix_commands=[],
+        )
         await vehicle.poll_vehicle_refresh()
         client.graphql_refresh_status.assert_awaited_once_with("SYNTHETIC26BEV", "CA")
         self.assertEqual(ha.integration_runtime._websocket_contexts([vehicle]), {

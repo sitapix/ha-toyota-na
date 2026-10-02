@@ -17,6 +17,7 @@ MODULE_PATH = ROOT / "custom_components/toyota_na/patch_client.py"
 SPEC = importlib.util.spec_from_file_location("appsync_patch_client", MODULE_PATH)
 patch_client = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(patch_client)
+patch_client.WAKE_SETTLE_SECONDS = 0
 
 # AppSync reports a field missing from the schema as a validation error message.
 SCHEMA_ERROR = {"message": "Validation error of type FieldUndefined: actualChargingRate"}
@@ -141,7 +142,8 @@ class _CommandClient:
         self.command_calls = []
         self.calls = []
 
-    async def graphql_pre_wake(self, guid, region):
+    async def api_post(self, endpoint, json, header_params=None):
+        assert endpoint.endswith("/v1/remote/route/wake") and json is None
         self.calls.append("pre-wake")
 
     async def graphql_send_remote_command(self, vin, command, region):
@@ -200,7 +202,7 @@ class AppSyncTransportTests(unittest.IsolatedAsyncioTestCase):
                     callback = {"vin": "TESTVIN24", "status": "COMPLETED", **fields}
                     websocket = _CallbackWebSocket([
                         {"vin": "OTHER", "status": "COMPLETED", **fields},
-                        {"vin": "TESTVIN24", "appRequestNo": 41, "status": "ERROR"},
+                        {"vin": "TESTVIN24", "appRequestNo": 41, "status": "IN_PROGRESS"},
                         {"vin": "TESTVIN24", "status": "IN_PROGRESS", **fields},
                         callback,
                     ])
@@ -224,13 +226,28 @@ class AppSyncTransportTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual([], websocket.callbacks)
 
     async def test_remote_failures_report_the_callback_without_waiting_for_timeout(self):
-        for status in ("terminated", "interrupted", "popup_required", "RES1", None, "unexpected"):
+        for status in ("terminated", "interrupted", "RES1", None, "unexpected"):
             with self.subTest(status=status):
                 websocket = _StatusWebSocket([status])
                 with patch.object(patch_client.aiohttp, "ClientSession", return_value=_WebSocketSession(websocket)):
                     with self.assertRaisesRegex(RuntimeError, "Vehicle rejected"):
                         await patch_client.remote_request_24mm(_CommandClient(), "TESTVIN24", "engine-start")
                 self.assertEqual([], websocket.statuses)
+
+    async def test_remote_commands_accept_callbacks_with_another_request_number(self):
+        # Toyota's app matches remote-command callbacks by VIN; appRequestNo is
+        # not the submission's requestNo.
+        callback = {"vin": "TESTVIN24", "appRequestNo": 7, "status": "COMPLETED"}
+        websocket = _CallbackWebSocket([callback])
+        with patch.object(patch_client.aiohttp, "ClientSession", return_value=_WebSocketSession(websocket)):
+            result = await patch_client.remote_request_24mm(_CommandClient(), "TESTVIN24", "engine-start")
+        self.assertEqual(callback, result)
+
+    async def test_popup_required_asks_for_autofix(self):
+        websocket = _StatusWebSocket(["popup_required"])
+        with patch.object(patch_client.aiohttp, "ClientSession", return_value=_WebSocketSession(websocket)):
+            with self.assertRaises(patch_client.RemoteCommandNeedsAutoFix):
+                await patch_client.remote_request_24mm(_CommandClient(), "TESTVIN24", "engine-start")
 
     async def test_remote_progress_and_unknown_charging_status_keep_waiting(self):
         for command, statuses in (

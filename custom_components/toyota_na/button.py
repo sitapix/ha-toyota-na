@@ -44,6 +44,10 @@ async def async_setup_entry(
                 yield ToyotaRefreshButton(
                     config_entry, coordinator, "Refresh Status", vehicle.vin
                 )
+            if getattr(vehicle, "can_wake", False):
+                yield ToyotaWakeButton(
+                    config_entry, coordinator, "Wake Vehicle", vehicle.vin
+                )
 
     setup_entity_discovery(
         config_entry,
@@ -128,3 +132,22 @@ class ToyotaRefreshButton(ToyotaButtonBase):
             await vehicle.poll_vehicle_refresh()
         record_vehicle_wake(self.hass, self._config_entry, self.vin)
         self._schedule_refresh()
+
+
+class ToyotaWakeButton(ToyotaButtonBase):
+    """Wake the vehicle like Toyota's app does when it opens."""
+
+    _attr_icon = "mdi:car-connected"
+
+    @property
+    def available(self) -> bool:
+        vehicle = self.vehicle
+        return vehicle is not None and getattr(vehicle, "can_wake", False)
+
+    async def async_press(self) -> None:
+        """Wake the telematics unit; it does not request a status report."""
+        vehicle = self.vehicle
+        if vehicle is None:
+            return
+        with translate_service_errors():
+            await vehicle.wake()
