@@ -190,6 +190,96 @@ class SubmissionHttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("TESTVIN24", " ".join(logs.output))
 
 
+class ReachabilityTests(unittest.IsolatedAsyncioTestCase):
+    async def send(self, toyota, command):
+        websocket = transport._WebSocket()
+        with patch.object(client.aiohttp, "ClientSession", return_value=transport._WebSocketSession(websocket)):
+            return await client.remote_request_24mm(toyota, "TESTVIN24", command)
+
+    async def test_vehicle_command_wakes_vehicle_first_and_waits_longer(self):
+        toyota = transport._CommandClient()
+        with patch.object(client, "_wait_for_remote_command_result", AsyncMock(return_value={})) as waiter:
+            await self.send(toyota, "engine-start")
+        self.assertEqual(["pre-wake", "engine-start"], toyota.calls)
+        self.assertEqual(client.VEHICLE_COMMAND_TIMEOUT, waiter.call_args.kwargs["timeout"])
+        self.assertIn("pre_wake_sent", [e["event"] for e in toyota._remote_command_history[-1]["events"]])
+
+    async def test_charge_command_keeps_default_wait_without_wake(self):
+        toyota = transport._CommandClient()
+        with patch.object(client, "_wait_for_remote_command_result", AsyncMock(return_value={})) as waiter:
+            await self.send(toyota, "charge-stop")
+        self.assertEqual(["charge-stop"], toyota.calls)
+        self.assertIsNone(waiter.call_args.kwargs["timeout"])
+
+    async def test_failed_pre_wake_still_sends_command_once(self):
+        toyota = transport._CommandClient()
+        toyota.graphql_pre_wake = AsyncMock(side_effect=RuntimeError("asleep"))
+        with patch.object(client, "_wait_for_remote_command_result", AsyncMock(return_value={})):
+            await self.send(toyota, "engine-start")
+        self.assertEqual(["engine-start"], toyota.calls)
+        self.assertIn("pre_wake_failed", [e["event"] for e in toyota._remote_command_history[-1]["events"]])
+
+    async def test_auth_failure_during_pre_wake_sends_nothing(self):
+        toyota = transport._CommandClient()
+        toyota.graphql_pre_wake = AsyncMock(side_effect=client.AuthError("expired"))
+        with self.assertRaises(client.AuthError):
+            await self.send(toyota, "engine-start")
+        self.assertEqual([], toyota.command_calls)
+
+    async def test_wait_honors_longer_timeout(self):
+        async def keepalive(*args):
+            await asyncio.sleep(0.001)
+            return {"type": "ka"}
+        with (
+            patch.object(client, "REMOTE_COMMAND_TIMEOUT", 0.005),
+            patch.object(client, "_receive_remote_socket_message", side_effect=keepalive) as receive,
+        ):
+            loop = asyncio.get_running_loop()
+            started = loop.time()
+            with self.assertRaises(client.RemoteCommandOutcomeUnknown):
+                await client._wait_for_remote_command_result(object(), "TESTVIN24", "subscription", timeout=0.05)
+        self.assertGreaterEqual(loop.time() - started, 0.05)
+
+
+class SubmissionErrorTests(unittest.IsolatedAsyncioTestCase):
+    async def submit_error(self, error):
+        toyota = transport._CommandClient()
+        toyota.graphql_send_remote_command = AsyncMock(side_effect=error)
+        with patch.object(client.aiohttp, "ClientSession", return_value=transport._WebSocketSession(transport._WebSocket())):
+            with self.assertRaises(Exception) as raised:
+                await client.remote_request_24mm(toyota, "TESTVIN24", "door-lock")
+        return raised.exception, toyota._remote_command_history[-1]["outcome"]
+
+    def response_error(self, status):
+        return client.aiohttp.ClientResponseError(
+            MagicMock(real_url="x"), (), status=status, message="Schedule overlaps [ONE-RES-40010]",
+        )
+
+    async def test_client_rejection_keeps_toyota_reason(self):
+        error, outcome = await self.submit_error(self.response_error(400))
+        self.assertIsInstance(error, client.aiohttp.ClientResponseError)
+        self.assertIn("ONE-RES-40010", error.message)
+        self.assertEqual("error", outcome)
+
+    async def test_refused_connection_is_not_uncertain(self):
+        error, outcome = await self.submit_error(client.aiohttp.ClientConnectorError(MagicMock(), OSError("refused")))
+        self.assertIsInstance(error, client.aiohttp.ClientConnectorError)
+        self.assertEqual("error", outcome)
+
+    async def test_server_error_after_send_is_uncertain(self):
+        error, outcome = await self.submit_error(self.response_error(503))
+        self.assertIsInstance(error, client.RemoteCommandOutcomeUnknown)
+        self.assertEqual("unknown", outcome)
+
+    def test_malformed_messages_do_not_hide_accepted_command(self):
+        for status in ({"messages": [None, "ok", {"responseCode": "ONE-RES-10000"}]}, "SUCCESS", None):
+            with self.subTest(status=status):
+                execution = {"payload": {"correlationId": "id"}, "status": status}
+                self.assertIs(execution, client._require_remote_execution(execution, {"events": []}))
+        with self.assertRaisesRegex(RuntimeError, "correlation ID"):
+            client._require_remote_execution("SUCCESS")
+
+
 class UncertainServiceTests(services.CommandServiceErrorTests):
     async def test_followup_read_is_cancelled_on_integration_unload(self):
         action, args, operation = self.actions[0]
