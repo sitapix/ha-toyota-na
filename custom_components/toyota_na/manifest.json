@@ -3,16 +3,10 @@
     "domain": "toyota_na",
     "name": "Toyota (North America)",
     "config_flow": true,
-    "documentation": "https://github.com/orienw/ha-toyota-na",
-    "codeowners": ["@orienw"],
+    "documentation": "https://github.com/sitapix/ha-toyota-na",
+    "codeowners": ["@sitapix", "@orienw"],
     "requirements": ["toyota-na==2.1.1"],
-    "issue_tracker": "https://github.com/orienw/ha-toyota-na/issues",
-    "version": "2.9.2",
+    "issue_tracker": "https://github.com/sitapix/ha-toyota-na/issues",
+    "version": "2.9.3b1",
     "iot_class": "cloud_polling"
 }
-
-
-
-
-
-

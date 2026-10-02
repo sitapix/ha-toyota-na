@@ -229,10 +229,19 @@ async def async_setup(hass: HomeAssistant, _processed_config) -> bool:
                 record_vehicle_wake(hass, config_entry, vin)
             coordinator.async_set_updated_data(coordinator.data)
         else:
-            with translate_service_errors():
+            def schedule_command_refresh():
+                if config_entry is not None:
+                    record_vehicle_wake(hass, config_entry, vin)
+                task = hass.async_create_task(
+                    _refresh_coordinator_after_command(coordinator, vin, command)
+                )
+                if config_entry is not None:
+                    config_entry.async_on_unload(task.cancel)
+
+            with translate_service_errors(on_uncertain=schedule_command_refresh):
                 await vehicle.send_command(command)
-            if config_entry is not None:
-                record_vehicle_wake(hass, config_entry, vin)
+            schedule_command_refresh()
+            return
 
         task = hass.async_create_task(
             _refresh_coordinator_after_command(coordinator, vin, command)
