@@ -1,7 +1,9 @@
 # Remote-command reliability beta
 
-Version **2.9.3b1**, based on orienw/ha-toyota-na commit
-`7e4c121e549e0b787daf58500e9c0672bdd379d5` (v2.9.2 code).
+Version **2.10.0b5.post1**: orienw/ha-toyota-na **v2.10.0b5**
+(`15c8bdbf3521297a0a0cf99844f582dc02636ea9`) plus the remote-command fixes
+below, which upstream does not include. Earlier builds of these fixes were
+published on top of v2.9.2 as 2.9.3b1 and 2.9.3b2.
 
 ## Changes
 
@@ -27,9 +29,22 @@ Version **2.9.3b1**, based on orienw/ha-toyota-na commit
   subject to the integration's existing redaction rules; review the complete
   download before sharing it publicly.
 
-The wire command remains `engine-start` for supported 24MM vehicles.
-There is no speculative switch to climate-start, added pre-wake, or longer
-timeout. An engine-running sensor alone cannot prove a remote-start session.
+- vehicle commands (start, stop, lock, unlock, hazards, find) send
+  the same best-effort pre-wake that Refresh uses, after the callback
+  subscription is ready and immediately before the command. A failed pre-wake
+  is recorded (`pre_wake_failed`) and the command is still sent once.
+- vehicle commands wait up to 180 seconds for Toyota's callback
+  instead of 60, because a sleeping vehicle can take about two minutes to act.
+  Charge commands keep the 60-second wait.
+- an HTTP 4xx response or refused connection while submitting is a
+  definite failure that keeps Toyota's reason (for example a charge-schedule
+  conflict) instead of being reported as an unknown outcome.
+- malformed `status`/`messages` entries no longer crash handling of
+  a submission Toyota already accepted.
+
+The wire command remains `engine-start` for supported 24MM vehicles; there is
+no speculative switch to climate-start. An engine-running sensor alone cannot
+prove a remote-start session.
 
 ## Validation and remaining uncertainty
 
@@ -48,7 +63,7 @@ This proves the software regressions are addressed, **not** that remote start
 works on a real vehicle. No vehicle commands were used to develop this beta.
 The cause of the original timeout remains unconfirmed.
 
-Validation on October 2, 2026: **324 tests passed** with Python 3.14.2.
+Validation on October 2, 2026: **405 tests passed** (2.10.0b5.post1) with Python 3.13.
 The integration and changed platforms also imported successfully against a
 real Home Assistant Core 2026.9.1 environment. The live instance is 2026.9.4;
 runtime behavior there still requires installation and verification.
@@ -60,11 +75,12 @@ runtime behavior there still requires installation and verification.
    Settings > Devices & services, preserving account/device/entity IDs.
 2. In HACS, remove the installed repository download, add
    `https://github.com/sitapix/ha-toyota-na` as an Integration custom repository,
-   enable prereleases, and download **v2.9.3b1** before restarting Home Assistant.
+   enable prereleases (otherwise HACS installs the old v2.9.2 code from
+   `main` without warning), and download **v2.10.0b5.post1** before restarting Home Assistant.
 3. After restart, confirm the existing Toyota entry is loaded and the same
    buttons, lock, and sensors are available. Merely installing this package
    does not submit a test command; existing scheduled-wake options still apply.
-4. To undo this beta, switch HACS back to `orienw/ha-toyota-na` **v2.9.2** and
+4. To undo this beta, switch HACS back to `orienw/ha-toyota-na` **v2.10.0b5** (or **v2.9.2**) and
    restart, retaining the same Toyota config entry. Do not restore the entire
    HA backup just to replace integration files.
 
@@ -83,9 +99,12 @@ Toyota's normal remote-start prerequisites satisfied:
    `in_progress` callbacks. Ignored vehicle/request events identify filtering.
    A completed callback confirms Toyota's reported completion, which should
    still be compared with physical behavior.
-5. If HA fails, compare with one Toyota-app attempt under the same conditions.
-   Use those observations to decide whether pre-wake or protocol changes are
-   justified. Avoid automatically trying alternate commands.
+5. Note when the vehicle physically starts, measured from the button press.
+   `pre_wake_sent` followed by `in_progress` callbacks and a late `completed`
+   means the vehicle was slow to wake. Also record the engine status
+   `lastUpdateBy`/`startTime` from the downloaded diagnostics.
+6. If HA fails, compare with one Toyota-app attempt under the same conditions.
+   Avoid automatically trying alternate commands.
 
 Protocol reference: [2026 RAV4 AppSync report](https://github.com/widewing/ha-toyota-na/issues/192).
 HA coordinator reference: [Fetching data](https://developers.home-assistant.io/docs/integration_fetching_data/).

@@ -27,6 +27,11 @@ HTTP_TIMEOUT = aiohttp.ClientTimeout(total=60, connect=30)
 _LOGGER = logging.getLogger(__name__)
 
 REMOTE_COMMAND_TIMEOUT = 60
+# A sleeping vehicle can take about two minutes to act on a command.
+VEHICLE_COMMAND_TIMEOUT = 180
+CHARGE_COMMANDS = (
+    "immediate-charge", "resume-charge", "charge-stop", "power-supply-stop",
+)
 REMOTE_COMMAND_UNKNOWN = (
     "Toyota did not confirm completion of the command. The vehicle outcome is "
     "unknown; check its status before trying again."
@@ -990,8 +995,12 @@ async def graphql_send_remote_command(
 
 
 def _require_remote_execution(execution, trace=None):
-    payload = (execution or {}).get("payload") or {}
-    messages = ((execution or {}).get("status") or {}).get("messages") or []
+    execution = execution if isinstance(execution, dict) else {}
+    payload = execution.get("payload")
+    payload = payload if isinstance(payload, dict) else {}
+    status = execution.get("status")
+    messages = status.get("messages") if isinstance(status, dict) else None
+    messages = [m for m in messages if isinstance(m, dict)] if isinstance(messages, list) else []
     _trace_event(
         trace, "submission_response",
         correlation_id_present=bool(payload.get("correlationId")),
@@ -1070,10 +1079,11 @@ async def _wait_for_remote_socket_event(
 
 
 async def _wait_for_remote_command_result(
-    ws, vin, subscription_id, request_no=None, *, fail_on_unknown=False, trace=None
+    ws, vin, subscription_id, request_no=None, *, fail_on_unknown=False, trace=None,
+    timeout=None,
 ):
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + REMOTE_COMMAND_TIMEOUT
+    deadline = loop.time() + (timeout or REMOTE_COMMAND_TIMEOUT)
     while loop.time() < deadline:
         message = await _receive_remote_socket_message(
             ws, max(1, deadline - loop.time())
@@ -1130,13 +1140,33 @@ async def _wait_for_remote_command_result(
 
 async def remote_request_24mm(self, vin, command, region="US"):
     """Run an AppSync command and await Toyota's callback."""
+    vehicle_command = command not in CHARGE_COMMANDS
+
+    async def submit():
+        if vehicle_command:
+            await _pre_wake_for_command(self, vin, region)
+        return await self.graphql_send_remote_command(vin, command, region)
+
     return await _run_appsync_operation(
-        self, vin, lambda: self.graphql_send_remote_command(vin, command, region), region,
-        fail_on_unknown=command not in (
-            "immediate-charge", "resume-charge", "charge-stop", "power-supply-stop",
-        ),
+        self, vin, submit, region,
+        fail_on_unknown=vehicle_command,
         command=command,
+        timeout=VEHICLE_COMMAND_TIMEOUT if vehicle_command else None,
     )
+
+
+async def _pre_wake_for_command(self, vin, region):
+    """Wake the telematics unit like Refresh does; the command is sent either way."""
+    trace = _active_command_trace(self, vin)
+    try:
+        await self.graphql_pre_wake(await self.auth.get_guid(), region)
+    except (AuthError, asyncio.CancelledError):
+        raise
+    except Exception as err:
+        _trace_event(trace, "pre_wake_failed")
+        _LOGGER.debug("Pre-wake before remote command failed: %s", type(err).__name__)
+    else:
+        _trace_event(trace, "pre_wake_sent")
 
 
 async def update_charge_settings(self, vin, variable, value, region="US"):
@@ -1223,7 +1253,9 @@ async def save_climate_schedule(self, vin, generation, schedule, region="US", br
     return result if isinstance(result, dict) else {}
 
 
-async def _run_appsync_operation(self, vin, submit, region, *, fail_on_unknown=False, command=None):
+async def _run_appsync_operation(
+    self, vin, submit, region, *, fail_on_unknown=False, command=None, timeout=None,
+):
     # Callbacks can omit request numbers, so serialize this account's
     # operations for each vehicle.
     if not hasattr(self, "_remote_locks"):
@@ -1250,6 +1282,7 @@ async def _run_appsync_operation(self, vin, submit, region, *, fail_on_unknown=F
         try:
             result = await _execute_appsync_operation(
                 self, vin, submit, region, fail_on_unknown=fail_on_unknown, trace=trace,
+                timeout=timeout,
             )
             trace["outcome"] = "completed"
             return result
@@ -1271,7 +1304,9 @@ async def _run_appsync_operation(self, vin, submit, region, *, fail_on_unknown=F
             _LOGGER.debug("Remote command summary: %s", trace)
 
 
-async def _execute_appsync_operation(self, vin, submit, region, *, fail_on_unknown=False, trace=None):
+async def _execute_appsync_operation(
+    self, vin, submit, region, *, fail_on_unknown=False, trace=None, timeout=None,
+):
     token = await self.auth.get_access_token()
     guid = await self.auth.get_guid()
     authorization = appsync_authorization(
@@ -1323,6 +1358,13 @@ async def _execute_appsync_operation(self, vin, submit, region, *, fail_on_unkno
             try:
                 execution = await submit()
             except (asyncio.TimeoutError, aiohttp.ClientError) as err:
+                # A 4xx response or a refused connection means Toyota never took
+                # the command; keep its reason instead of reporting "unknown".
+                if isinstance(err, aiohttp.ClientConnectorError) or (
+                    isinstance(err, aiohttp.ClientResponseError) and err.status < 500
+                ):
+                    _trace_event(trace, "submission_failed")
+                    raise
                 _trace_event(trace, "submission_transport_error")
                 raise RemoteCommandOutcomeUnknown(REMOTE_COMMAND_UNKNOWN) from err
             _trace_event(trace, "awaiting_callback")
@@ -1332,6 +1374,7 @@ async def _execute_appsync_operation(self, vin, submit, region, *, fail_on_unkno
             try:
                 return await _wait_for_remote_command_result(
                     ws, vin, subscription_id, request_no, fail_on_unknown=fail_on_unknown, trace=trace,
+                    timeout=timeout,
                 )
             except (RemoteCommandRejected, RemoteCommandOutcomeUnknown):
                 raise
