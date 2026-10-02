@@ -136,8 +136,13 @@ class _CommandClient:
     def __init__(self):
         self.auth = _Auth()
         self.command_calls = []
+        self.calls = []
+
+    async def graphql_pre_wake(self, guid, region):
+        self.calls.append("pre-wake")
 
     async def graphql_send_remote_command(self, vin, command, region):
+        self.calls.append(command)
         self.command_calls.append((vin, command, region))
         return {
             "payload": {

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+from copy import deepcopy
 
 from homeassistant.components.diagnostics import async_redact_data
 from homeassistant.config_entries import ConfigEntry
@@ -153,6 +154,7 @@ async def async_get_config_entry_diagnostics(
             "telemetry": {"data": telemetry},
             "engine_status": {"data": engine_status},
             "electric_status": {"data": electric_status},
+            "remote_commands": deepcopy(getattr(client, "_remote_command_history", [])),
         },
         TO_REDACT,
     )

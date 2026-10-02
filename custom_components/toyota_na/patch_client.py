@@ -2,8 +2,10 @@ import asyncio
 import base64
 import json
 import logging
+import re
 import time
 import uuid
+from datetime import datetime, timezone
 from urllib.parse import urlencode, urljoin
 
 import aiohttp
@@ -23,6 +25,60 @@ ELECTRIC_COMMAND_TIMEOUT = 90
 HTTP_TIMEOUT = aiohttp.ClientTimeout(total=60, connect=30)
 
 _LOGGER = logging.getLogger(__name__)
+
+REMOTE_COMMAND_TIMEOUT = 60
+# A sleeping vehicle can take about two minutes to act on a command.
+VEHICLE_COMMAND_TIMEOUT = 180
+CHARGE_COMMANDS = (
+    "immediate-charge", "resume-charge", "charge-stop", "power-supply-stop",
+)
+REMOTE_COMMAND_UNKNOWN = (
+    "Toyota did not confirm completion of the command. The vehicle outcome is "
+    "unknown; check its status before trying again."
+)
+
+
+class RemoteCommandOutcomeUnknown(RuntimeError):
+    """A command may have reached the vehicle, but its result is unknown."""
+
+
+class RemoteCommandRejected(RuntimeError):
+    """Toyota explicitly rejected a command."""
+
+
+def _safe_result_code(value):
+    """Keep protocol codes only, never arbitrary response text or identifiers."""
+    if value is None:
+        return None
+    if isinstance(value, str) and (
+        re.fullmatch(r"ONE-(?:[A-Z]+-)*\d{5}", value)
+        or value in ("ERROR", "FAILED", "FAILURE", "REJECTED", "SUCCESS")
+    ):
+        return value
+    return "unrecognized"
+
+
+def _remote_failure_code(value):
+    # Do not guess the meaning of undocumented codes. Known Toyota 4xxxx/5xxxx
+    # errors and explicit failure words must not be hidden by a correlation ID.
+    return isinstance(value, str) and (
+        value in ("ERROR", "FAILED", "FAILURE", "REJECTED")
+        or re.fullmatch(r"ONE-(?:[A-Z]+-)*[45]\d{4}", value) is not None
+    )
+
+
+def _trace_event(trace, event, **fields):
+    """Record a bounded sequence of allowlisted protocol facts."""
+    if trace is None:
+        return
+    entry = {"event": event, **fields}
+    trace["events"].append(entry)
+    del trace["events"][:-40]
+    _LOGGER.debug("Remote command progress: %s", entry)
+
+
+def _active_command_trace(client, vin):
+    return getattr(client, "_remote_command_traces", {}).get(vin)
 
 
 # --- GraphQL Operations ---
@@ -582,6 +638,9 @@ async def graphql_request(
             async with session.post(GRAPHQL_ENDPOINT, headers=headers, data=payload) as resp:
                 body = await resp.text()
                 status = resp.status
+            trace = _active_command_trace(self, vin)
+            if not read_only:
+                _trace_event(trace, "http_response", status=status)
             try:
                 result = json.loads(body)
             except json.JSONDecodeError:
@@ -589,6 +648,11 @@ async def graphql_request(
                     raise
                 result = {}
             errors = result.get("errors") or []
+            if errors and not read_only:
+                _trace_event(trace, "graphql_errors", codes=[
+                    _safe_result_code((err.get("extensions") or {}).get("responseCode"))
+                    for err in errors[:10]
+                ])
             auth_errors = errors or ([result] if status == 403 else [])
             auth_failed = status == 401 or any(
                 err.get("errorType") in ("APIGW-403", "APPSYNC-AUTH-403")
@@ -610,13 +674,14 @@ async def graphql_request(
                 retries += 1
                 continue
             if status >= 400:
-                _LOGGER.debug(
-                    "GraphQL %s error: HTTP %d: %s",
-                    operation_name,
-                    status,
-                    body[:500],
-                )
+                if trace is None:
+                    _LOGGER.debug(
+                        "GraphQL %s error: HTTP %d: %s",
+                        operation_name, status, body[:500],
+                    )
                 if raise_errors:
+                    if trace is not None and not read_only and status >= 500:
+                        raise RemoteCommandOutcomeUnknown(REMOTE_COMMAND_UNKNOWN)
                     raise RuntimeError(
                         "Toyota GraphQL %s failed with HTTP %d"
                         % (operation_name, status)
@@ -624,12 +689,11 @@ async def graphql_request(
                 return None
             if errors:
                 err = errors[0]
-                _LOGGER.debug(
-                    "GraphQL %s error: %s: %s",
-                    operation_name,
-                    err.get("errorType"),
-                    err.get("message"),
-                )
+                if trace is None:
+                    _LOGGER.debug(
+                        "GraphQL %s error: %s: %s",
+                        operation_name, err.get("errorType"), err.get("message"),
+                    )
                 if raise_errors:
                     extensions = err.get("extensions") or {}
                     code = (
@@ -714,17 +778,32 @@ async def graphql_send_remote_command(
         raise_errors=True,
     )
     execution = data.get("executeRemoteCommand") if data else None
-    return _require_remote_execution(execution)
+    return _require_remote_execution(execution, _active_command_trace(self, vin))
 
 
-def _require_remote_execution(execution):
-    correlation_id = ((execution or {}).get("payload") or {}).get(
-        "correlationId"
+def _require_remote_execution(execution, trace=None):
+    execution = execution if isinstance(execution, dict) else {}
+    payload = execution.get("payload")
+    payload = payload if isinstance(payload, dict) else {}
+    status = execution.get("status")
+    messages = status.get("messages") if isinstance(status, dict) else None
+    messages = [m for m in messages if isinstance(m, dict)] if isinstance(messages, list) else []
+    _trace_event(
+        trace, "submission_response",
+        correlation_id_present=bool(payload.get("correlationId")),
+        request_number_present=payload.get("requestNo") is not None,
+        return_code=_safe_result_code(payload.get("returnCode")),
+        response_codes=[_safe_result_code(m.get("responseCode")) for m in messages[:10]],
     )
-    if correlation_id:
+    failures = [m for m in messages if _remote_failure_code(m.get("responseCode"))]
+    if _remote_failure_code(payload.get("returnCode")) or failures:
+        message = failures[0] if failures else (messages[0] if messages else {})
+        detail = message.get("detailedDescription") or message.get("description")
+        code = payload.get("returnCode") if _remote_failure_code(payload.get("returnCode")) else message.get("responseCode")
+        raise RemoteCommandRejected(f"{detail or 'Toyota rejected the remote command.'} [{code}]")
+    if payload.get("correlationId"):
         return execution
 
-    messages = ((execution or {}).get("status") or {}).get("messages") or []
     message = messages[0] if messages else {}
     detail = (
         message.get("detailedDescription")
@@ -787,10 +866,11 @@ async def _wait_for_remote_socket_event(
 
 
 async def _wait_for_remote_command_result(
-    ws, vin, subscription_id, request_no=None, *, fail_on_unknown=False
+    ws, vin, subscription_id, request_no=None, *, fail_on_unknown=False, trace=None,
+    timeout=None,
 ):
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + 60
+    deadline = loop.time() + (timeout or REMOTE_COMMAND_TIMEOUT)
     while loop.time() < deadline:
         message = await _receive_remote_socket_message(
             ws, max(1, deadline - loop.time())
@@ -801,6 +881,7 @@ async def _wait_for_remote_command_result(
         if message_type in ("connection_error", "error"):
             raise RuntimeError(_remote_socket_error(message))
         if message_type != "data" or message.get("id") != subscription_id:
+            _trace_event(trace, "ignored_envelope")
             continue
 
         callback = (
@@ -810,6 +891,7 @@ async def _wait_for_remote_command_result(
             or {}
         )
         if callback.get("vin") != vin:
+            _trace_event(trace, "ignored_vehicle")
             continue
         callback_request_no = callback.get("appRequestNo")
         # Request numbers are optional; Toyota's app matches callbacks by VIN.
@@ -818,32 +900,60 @@ async def _wait_for_remote_command_result(
             and callback_request_no is not None
             and str(callback_request_no) != str(request_no)
         ):
+            _trace_event(trace, "ignored_request_number")
             continue
         status = str(callback.get("status") or "unknown").lower()
+        _trace_event(
+            trace, "callback",
+            status=status if status in (
+                "completed", "in_progress", "error", "timeout", "terminated",
+                "interrupted", "popup_required",
+            ) else "unknown",
+            request_number_present=callback_request_no is not None,
+            command_ended=callback.get("commandEnded") is True,
+        )
         detail = callback.get("message")
         if status == "completed":
             return callback
         if status == "in_progress":
             continue
         if fail_on_unknown or status in ("error", "timeout") or callback.get("commandEnded") is True:
-            raise RuntimeError(
+            raise RemoteCommandRejected(
                 detail
                 or f"Toyota ended the remote command with status {status}."
             )
-    raise RuntimeError(
-        "Toyota accepted the command but did not report completion within "
-        "60 seconds."
-    )
+    raise RemoteCommandOutcomeUnknown(REMOTE_COMMAND_UNKNOWN)
 
 
 async def remote_request_24mm(self, vin, command, region="US"):
     """Run an AppSync command and await Toyota's callback."""
+    vehicle_command = command not in CHARGE_COMMANDS
+
+    async def submit():
+        if vehicle_command:
+            await _pre_wake_for_command(self, vin, region)
+        return await self.graphql_send_remote_command(vin, command, region)
+
     return await _run_appsync_operation(
-        self, vin, lambda: self.graphql_send_remote_command(vin, command, region), region,
-        fail_on_unknown=command not in (
-            "immediate-charge", "resume-charge", "charge-stop", "power-supply-stop",
-        ),
+        self, vin, submit, region,
+        fail_on_unknown=vehicle_command,
+        command=command,
+        timeout=VEHICLE_COMMAND_TIMEOUT if vehicle_command else None,
     )
+
+
+async def _pre_wake_for_command(self, vin, region):
+    """Wake the telematics unit like Refresh does; the command is sent either way."""
+    trace = _active_command_trace(self, vin)
+    try:
+        await self.graphql_pre_wake(await self.auth.get_guid(), region)
+    except (AuthError, asyncio.CancelledError):
+        raise
+    except Exception as err:
+        _trace_event(trace, "pre_wake_failed")
+        _LOGGER.debug("Pre-wake before remote command failed: %s", type(err).__name__)
+    else:
+        _trace_event(trace, "pre_wake_sent")
 
 
 async def update_charge_settings(self, vin, variable, value, region="US"):
@@ -862,7 +972,9 @@ async def update_charge_settings(self, vin, variable, value, region="US"):
         data = await self.graphql_request(
             operation, document, variables, vin=vin, region=region, raise_errors=True,
         )
-        return _require_remote_execution(data.get(key) if data else None)
+        return _require_remote_execution(
+            data.get(key) if data else None, _active_command_trace(self, vin),
+        )
 
     return await _run_appsync_operation(self, vin, submit, region)
 
@@ -902,19 +1014,60 @@ async def save_charge_schedule(self, vin, generation, schedule, region="US", bra
     return await submit()
 
 
-async def _run_appsync_operation(self, vin, submit, region, *, fail_on_unknown=False):
+async def _run_appsync_operation(
+    self, vin, submit, region, *, fail_on_unknown=False, command=None, timeout=None,
+):
     # Callbacks can omit request numbers, so serialize this account's
     # operations for each vehicle.
     if not hasattr(self, "_remote_locks"):
         self._remote_locks = {}
     lock = self._remote_locks.setdefault(vin, asyncio.Lock())
     async with lock:
-        return await _execute_appsync_operation(
-            self, vin, submit, region, fail_on_unknown=fail_on_unknown,
-        )
+        if not hasattr(self, "_remote_command_history"):
+            self._remote_command_history = []
+            self._remote_command_traces = {}
+        trace = {
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "command": command if command in (
+                "engine-start", "engine-stop", "door-lock", "door-unlock",
+                "hazard-on", "hazard-off", "find-vehicle", "add-runtime",
+                "immediate-charge", "resume-charge", "charge-stop", "power-supply-stop",
+            ) else "other",
+            "events": [],
+            "outcome": "pending",
+        }
+        self._remote_command_history.append(trace)
+        del self._remote_command_history[:-10]
+        self._remote_command_traces[vin] = trace
+        started = time.monotonic()
+        try:
+            result = await _execute_appsync_operation(
+                self, vin, submit, region, fail_on_unknown=fail_on_unknown, trace=trace,
+                timeout=timeout,
+            )
+            trace["outcome"] = "completed"
+            return result
+        except RemoteCommandOutcomeUnknown:
+            trace["outcome"] = "unknown"
+            raise
+        except RemoteCommandRejected:
+            trace["outcome"] = "rejected"
+            raise
+        except asyncio.CancelledError:
+            trace["outcome"] = "cancelled"
+            raise
+        except Exception:
+            trace["outcome"] = "error"
+            raise
+        finally:
+            trace["elapsed_seconds"] = round(time.monotonic() - started, 2)
+            self._remote_command_traces.pop(vin, None)
+            _LOGGER.debug("Remote command summary: %s", trace)
 
 
-async def _execute_appsync_operation(self, vin, submit, region, *, fail_on_unknown=False):
+async def _execute_appsync_operation(
+    self, vin, submit, region, *, fail_on_unknown=False, trace=None, timeout=None,
+):
     token = await self.auth.get_access_token()
     guid = await self.auth.get_guid()
     authorization = appsync_authorization(
@@ -940,6 +1093,7 @@ async def _execute_appsync_operation(self, vin, submit, region, *, fail_on_unkno
         ) as ws:
             await ws.send_json({"type": "connection_init"})
             await _wait_for_remote_socket_event(ws, "connection_ack")
+            _trace_event(trace, "connection_ready")
 
             subscription_id = str(uuid.uuid4())
             await ws.send_json(
@@ -960,18 +1114,37 @@ async def _execute_appsync_operation(self, vin, submit, region, *, fail_on_unkno
             await _wait_for_remote_socket_event(
                 ws, "start_ack", subscription_id
             )
-            execution = await submit()
+            _trace_event(trace, "subscription_ready")
+            _trace_event(trace, "submitting")
+            try:
+                execution = await submit()
+            except (asyncio.TimeoutError, aiohttp.ClientError) as err:
+                # A 4xx response or a refused connection means Toyota never took
+                # the command; keep its reason instead of reporting "unknown".
+                if isinstance(err, aiohttp.ClientConnectorError) or (
+                    isinstance(err, aiohttp.ClientResponseError) and err.status < 500
+                ):
+                    _trace_event(trace, "submission_failed")
+                    raise
+                _trace_event(trace, "submission_transport_error")
+                raise RemoteCommandOutcomeUnknown(REMOTE_COMMAND_UNKNOWN) from err
+            _trace_event(trace, "awaiting_callback")
             request_no = ((execution or {}).get("payload") or {}).get(
                 "requestNo"
             )
             try:
                 return await _wait_for_remote_command_result(
-                    ws, vin, subscription_id, request_no, fail_on_unknown=fail_on_unknown,
+                    ws, vin, subscription_id, request_no, fail_on_unknown=fail_on_unknown, trace=trace,
+                    timeout=timeout,
                 )
+            except (RemoteCommandRejected, RemoteCommandOutcomeUnknown):
+                raise
             except asyncio.TimeoutError as err:
-                raise RuntimeError(
-                    "Toyota accepted the command but did not report completion within 60 seconds."
-                ) from err
+                _trace_event(trace, "callback_timeout")
+                raise RemoteCommandOutcomeUnknown(REMOTE_COMMAND_UNKNOWN) from err
+            except (aiohttp.ClientError, RuntimeError, json.JSONDecodeError) as err:
+                _trace_event(trace, "callback_connection_error")
+                raise RemoteCommandOutcomeUnknown(REMOTE_COMMAND_UNKNOWN) from err
 
 
 async def api_request(self, method, endpoint, header_params=None, **kwargs):
