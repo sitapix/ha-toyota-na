@@ -88,6 +88,17 @@ def _trace_event(trace, event, **fields):
     _LOGGER.debug("Remote command progress: %s", entry)
 
 
+def remember_vehicle_generation(client, vin, generation):
+    """Let account-level calls such as wake add per-vehicle headers if needed."""
+    if not isinstance(getattr(client, "_vehicle_generations", None), dict):
+        client._vehicle_generations = {}
+    client._vehicle_generations[vin] = generation
+
+
+def _active_generation(client, vin):
+    return (getattr(client, "_vehicle_generations", None) or {}).get(vin)
+
+
 def _active_command_trace(client, vin):
     return getattr(client, "_remote_command_traces", {}).get(vin)
 
@@ -1177,16 +1188,53 @@ async def remote_request_24mm(self, vin, command, region="US", autofix_commands=
     )
 
 
-async def wake_vehicles(self, region="US"):
-    """Wake the account's vehicles the way Toyota's app does when it opens."""
-    return await self.api_post(REMOTE_ROUTE + "wake", None, {"x-region": region})
+async def wake_vehicles(self, region="US", vin=None, generation=None):
+    """Wake the account's vehicles the way Toyota's app does when it opens.
+
+    The app sends no VIN, generation, brand or region with this call. If Toyota
+    rejects that, retry once with the per-vehicle headers other remote-route
+    calls use, and remember which form worked for diagnostics.
+    """
+    headers = await self._auth_headers()
+    for name in ("X-BRAND", "x-region"):
+        headers.pop(name, None)
+    headers.update({"X-APPBRAND": TRANSPORT_BRAND, "X-CORRELATIONID": str(uuid.uuid4())})
+    attempts = [("app", headers)]
+    if vin and generation:
+        attempts.append(("vehicle", {
+            **headers,
+            **_vehicle_headers(vin, region, **{"X-GENERATION": generation}),
+            "X-CORRELATIONID": str(uuid.uuid4()),
+        }))
+    results = []
+    async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as session:
+        for variant, request_headers in attempts:
+            async with session.post(REMOTE_ROUTE + "wake", headers=request_headers) as resp:
+                body = await resp.text()
+                code = None
+                try:
+                    messages = (json.loads(body).get("status") or {}).get("messages") or []
+                    code = messages[0].get("responseCode") if messages else None
+                except (ValueError, AttributeError, TypeError):
+                    pass
+                results.append({
+                    "variant": variant, "status": resp.status, "code": _safe_result_code(code),
+                })
+                if resp.status < 400:
+                    self._last_wake = {"at": datetime.now(timezone.utc).isoformat(), "attempts": results}
+                    return
+    self._last_wake = {"at": datetime.now(timezone.utc).isoformat(), "attempts": results}
+    raise RuntimeError(
+        "Toyota rejected the vehicle wake request [%s]"
+        % ", ".join(f"{r['variant']}: {r['status']} {r['code'] or ''}".strip() for r in results)
+    )
 
 
 async def _pre_wake_for_command(self, vin, region):
     """Wake the telematics unit like Toyota's app; the command is sent either way."""
     trace = _active_command_trace(self, vin)
     try:
-        await wake_vehicles(self, region)
+        await self.wake_vehicles(region, vin, _active_generation(self, vin))
     except (AuthError, asyncio.CancelledError):
         raise
     except Exception as err:

@@ -16,7 +16,7 @@ from toyota_na.vehicle.entity_types.ToyotaNumeric import ToyotaNumeric
 from toyota_na.vehicle.entity_types.ToyotaOpening import ToyotaOpening
 from toyota_na.vehicle.entity_types.ToyotaRemoteStart import ToyotaRemoteStart
 
-from .patch_client import RemoteCommandNeedsAutoFix
+from .patch_client import RemoteCommandNeedsAutoFix, remember_vehicle_generation
 from .vehicle_helpers import (
     backdoor_candidates,
     can_extend_remote_runtime,
@@ -352,7 +352,7 @@ class SeventeenCYPlusToyotaVehicle(ToyotaVehicle):
 
     async def wake(self) -> None:
         """Wake the vehicle's telematics unit without requesting a status report."""
-        await self._client.wake_vehicles(self._region)
+        await self._client.wake_vehicles(self._region, self._vin, self.api_generation)
 
     def remote_autofix_commands(self, *, assume_open: bool = False) -> list[str]:
         """Mirror the lock/close fixes Toyota's app sends with a remote start.
@@ -409,6 +409,7 @@ class SeventeenCYPlusToyotaVehicle(ToyotaVehicle):
             return
         command_name = self._command_map[command]
         if self.uses_appsync:
+            remember_vehicle_generation(self._client, self._vin, self.api_generation)
             if command != RemoteRequestCommand.EngineStart:
                 await self._client.remote_request_24mm(
                     self._vin, command_name, self._region

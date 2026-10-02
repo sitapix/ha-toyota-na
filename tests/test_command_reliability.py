@@ -216,7 +216,7 @@ class ReachabilityTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_failed_pre_wake_still_sends_command_once(self):
         toyota = transport._CommandClient()
-        toyota.api_post = AsyncMock(side_effect=RuntimeError("asleep"))
+        toyota.wake_vehicles = AsyncMock(side_effect=RuntimeError("asleep"))
         with patch.object(client, "_wait_for_remote_command_result", AsyncMock(return_value={})):
             await self.send(toyota, "engine-start")
         self.assertEqual(["engine-start"], toyota.calls)
@@ -224,7 +224,7 @@ class ReachabilityTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_auth_failure_during_pre_wake_sends_nothing(self):
         toyota = transport._CommandClient()
-        toyota.api_post = AsyncMock(side_effect=client.AuthError("expired"))
+        toyota.wake_vehicles = AsyncMock(side_effect=client.AuthError("expired"))
         with self.assertRaises(client.AuthError):
             await self.send(toyota, "engine-start")
         self.assertEqual([], toyota.command_calls)
@@ -381,14 +381,62 @@ class AutoFixTests(unittest.IsolatedAsyncioTestCase):
         vehicle, toyota = await self.make()
         self.assertTrue(vehicle.can_wake)
         await vehicle.wake()
-        toyota.wake_vehicles.assert_awaited_once_with(vehicle.region)
+        toyota.wake_vehicles.assert_awaited_once_with(vehicle.region, vehicle.vin, vehicle.api_generation)
 
-    async def test_wake_request_matches_toyota_app(self):
-        toyota = SimpleNamespace(api_post=AsyncMock())
-        await client.wake_vehicles(toyota, "US")
-        toyota.api_post.assert_awaited_once_with(
-            "https://onecdn.telematicsct.com/v1/remote/route/wake", None, {"x-region": "US"},
-        )
+    async def wake(self, statuses):
+        sent = []
+
+        class Response:
+            def __init__(self, status):
+                self.status = status
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *args):
+                return False
+            async def text(self):
+                return json.dumps({"status": {"messages": [{"responseCode": "ONE-RS-10003"}]}})
+
+        class Session:
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *args):
+                return False
+            def post(self, url, headers):
+                sent.append((url, headers))
+                return Response(statuses[len(sent) - 1])
+
+        toyota = SimpleNamespace(_auth_headers=AsyncMock(return_value={
+            "AUTHORIZATION": "Bearer t", "X-GUID": "g", "X-BRAND": "T", "x-region": "US",
+        }))
+        with patch.object(client.aiohttp, "ClientSession", return_value=Session()):
+            try:
+                await client.wake_vehicles(toyota, "US", "VIN1", "24MM")
+            except RuntimeError as err:
+                return sent, toyota._last_wake, err
+        return sent, toyota._last_wake, None
+
+    async def test_wake_sends_the_app_request_first(self):
+        sent, last, error = await self.wake([200])
+        self.assertIsNone(error)
+        url, headers = sent[0]
+        self.assertEqual("https://onecdn.telematicsct.com/v1/remote/route/wake", url)
+        self.assertNotIn("X-BRAND", headers)
+        self.assertNotIn("x-region", headers)
+        self.assertNotIn("VIN", headers)
+        self.assertEqual("T", headers["X-APPBRAND"])
+        self.assertEqual([("app", 200)], [(a["variant"], a["status"]) for a in last["attempts"]])
+
+    async def test_rejected_app_wake_retries_with_vehicle_headers(self):
+        sent, last, error = await self.wake([400, 200])
+        self.assertIsNone(error)
+        self.assertEqual("VIN1", sent[1][1]["VIN"])
+        self.assertEqual("24MM", sent[1][1]["X-GENERATION"])
+        self.assertEqual(["app", "vehicle"], [a["variant"] for a in last["attempts"]])
+
+    async def test_rejected_wake_reports_codes_without_identifiers(self):
+        sent, last, error = await self.wake([400, 400])
+        self.assertIn("ONE-RS-10003", str(error))
+        self.assertNotIn("VIN1", json.dumps(last))
 
 class UncertainServiceTests(services.CommandServiceErrorTests):
     async def test_followup_read_is_cancelled_on_integration_unload(self):

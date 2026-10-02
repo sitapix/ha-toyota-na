@@ -155,6 +155,7 @@ async def async_get_config_entry_diagnostics(
             "engine_status": {"data": engine_status},
             "electric_status": {"data": electric_status},
             "remote_commands": deepcopy(getattr(client, "_remote_command_history", [])),
+            "last_wake": deepcopy(getattr(client, "_last_wake", None)),
         },
         TO_REDACT,
     )

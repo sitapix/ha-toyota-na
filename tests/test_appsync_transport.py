@@ -142,8 +142,7 @@ class _CommandClient:
         self.command_calls = []
         self.calls = []
 
-    async def api_post(self, endpoint, json, header_params=None):
-        assert endpoint.endswith("/v1/remote/route/wake") and json is None
+    async def wake_vehicles(self, region, vin=None, generation=None):
         self.calls.append("pre-wake")
 
     async def graphql_send_remote_command(self, vin, command, region):
