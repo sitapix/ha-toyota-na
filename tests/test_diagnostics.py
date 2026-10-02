@@ -49,6 +49,7 @@ class DiagnosticsTests(unittest.IsolatedAsyncioTestCase):
             get_user_vehicle_list=AsyncMock(return_value=[vehicle]),
             graphql_get_vehicle_status=AsyncMock(return_value={}),
             get_telemetry=AsyncMock(return_value={}),
+            _remote_command_history=[{"command": "engine-start", "outcome": "unknown", "events": []}],
         )
         entry = ha.ConfigEntry()
         entry.data = {"email": "owner@example.com", "tokens": {"guid": "owner"}}
@@ -60,5 +61,7 @@ class DiagnosticsTests(unittest.IsolatedAsyncioTestCase):
         payload, payload_keys = redact.call_args_list[1].args
         self.assertEqual(entry.data, config_data)
         self.assertEqual([vehicle], payload["vehicle_list"]["data"])
+        self.assertEqual(client._remote_command_history, payload["remote_commands"])
+        self.assertIsNot(client._remote_command_history, payload["remote_commands"])
         for keys in (config_keys, payload_keys):
             self.assertTrue({"remoteUserGuid", "subscriberGuid", "accountInfoId", "guid", "vin", "email", "password"} <= keys)

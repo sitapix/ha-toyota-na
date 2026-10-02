@@ -125,15 +125,18 @@ class ToyotaLock(ToyotaNABaseEntity, LockEntity):
             self._state_changing = True
             self.async_write_ha_state()
             try:
-                with translate_service_errors():
+                with translate_service_errors(on_uncertain=self._schedule_command_refresh):
                     await self.vehicle.send_command(COMMAND_MAP[command])
             except (Exception, asyncio.CancelledError):
                 self._state_changing = False
                 self.async_write_ha_state()
                 raise
-            record_vehicle_wake(self.hass, self._config_entry, self.vin)
-            task = self.hass.async_create_task(self._background_refresh())
-            self._config_entry.async_on_unload(task.cancel)
+            self._schedule_command_refresh()
+
+    def _schedule_command_refresh(self):
+        record_vehicle_wake(self.hass, self._config_entry, self.vin)
+        task = self.hass.async_create_task(self._background_refresh())
+        self._config_entry.async_on_unload(task.cancel)
 
     async def _background_refresh(self):
         """Refresh coordinator state after a remote command."""

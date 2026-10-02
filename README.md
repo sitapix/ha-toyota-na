@@ -2,10 +2,14 @@
 
 ## Introduction
 This is a Home Assistant integration for Toyota and Lexus connected services in
-North America, maintained by [@orienw](https://github.com/orienw). It is a fork of
-[widewing/ha-toyota-na](https://github.com/widewing/ha-toyota-na).
+North America. This personal fork builds on [orienw/ha-toyota-na](https://github.com/orienw/ha-toyota-na),
+which builds on [widewing/ha-toyota-na](https://github.com/widewing/ha-toyota-na).
 
-Report problems and request features in [this fork's issue tracker](https://github.com/orienw/ha-toyota-na/issues).
+The current beta improves remote-command failure handling and diagnostics.
+See [remote-command changes and validation](docs/remote-command-beta.md).
+Vehicle operation has not yet been verified with this beta.
+
+Report problems and request features in [this fork's issue tracker](https://github.com/sitapix/ha-toyota-na/issues).
 
 ## Vehicle support
 
@@ -26,8 +30,8 @@ integration under **Settings > Devices & services**. Each vehicle's
 
 ## Releases
 
-[![Latest stable release](https://img.shields.io/github/v/release/orienw/ha-toyota-na?sort=date&style=for-the-badge&label=stable)](https://github.com/orienw/ha-toyota-na/releases/latest)
-[![Latest beta release](https://img.shields.io/github/v/release/orienw/ha-toyota-na?include_prereleases&filter=*b*&sort=date&style=for-the-badge&label=beta&color=orange)](https://github.com/orienw/ha-toyota-na/releases)
+[![Latest stable release](https://img.shields.io/github/v/release/sitapix/ha-toyota-na?sort=date&style=for-the-badge&label=stable)](https://github.com/sitapix/ha-toyota-na/releases/latest)
+[![Latest beta release](https://img.shields.io/github/v/release/sitapix/ha-toyota-na?include_prereleases&filter=*b*&sort=date&style=for-the-badge&label=beta&color=orange)](https://github.com/sitapix/ha-toyota-na/releases)
 
 ## Installation
 Requires Home Assistant 2024.11 or newer.
@@ -36,14 +40,15 @@ Requires Home Assistant 2024.11 or newer.
 
 If you already use the upstream integration, follow [Switching from upstream](#switching-from-upstream) first.
 
-[![Open this repository in HACS](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=orienw&repository=ha-toyota-na&category=integration)
+[![Open this repository in HACS](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=sitapix&repository=ha-toyota-na&category=integration)
 
 Use the button above, or add the repository manually:
 
 1. Open HACS, select the three-dot menu, then **Custom repositories**.
-2. Add `https://github.com/orienw/ha-toyota-na` with type **Integration**.
-3. Open this fork's entry and select **Download**. HACS installs the latest
-   stable release.
+2. Add `https://github.com/sitapix/ha-toyota-na` with type **Integration**.
+3. Open this fork's entry and select **Download**. Choose the latest version on
+   the [releases page](https://github.com/sitapix/ha-toyota-na/releases).
+   If that release is a prerelease, enable beta versions in HACS.
 4. Restart Home Assistant, then add **Toyota (North America)** under
    **Settings > Devices & services**.
 
@@ -57,17 +62,17 @@ This fork keeps the `toyota_na` domain and your existing account, device, and
 entity IDs. Leave the Toyota entry in place under **Settings > Devices &
 services** so configuration and automations stay put.
 
-1. In **HACS**, open the downloaded entry for `widewing/ha-toyota-na` and select
+1. In **HACS**, open the downloaded entry for `orienw/ha-toyota-na` (or `widewing/ha-toyota-na`) and select
    **Remove** from its three-dot menu. HACS removes the component files and
    leaves the Home Assistant data.
-2. Add `https://github.com/orienw/ha-toyota-na` as a custom repository with type
+2. Add `https://github.com/sitapix/ha-toyota-na` as a custom repository with type
    **Integration**.
 3. Download this fork's latest stable release. Finish the download before you
    restart Home Assistant.
 4. Restart Home Assistant, then open the Toyota integration and confirm
    vehicles and entities are still there.
 
-Confirm HACS lists `orienw/ha-toyota-na` as downloaded. Both repositories
+Confirm HACS lists `sitapix/ha-toyota-na` as downloaded. Both repositories
 install to `custom_components/toyota_na`, so only one can be installed at a
 time.
 
@@ -77,7 +82,7 @@ trunk entities.
 
 ### Manual installation
 
-1. Download `ha_toyota_na.zip` from the [latest stable release](https://github.com/orienw/ha-toyota-na/releases/latest).
+1. Download `ha_toyota_na.zip` from the latest release on the [releases page](https://github.com/sitapix/ha-toyota-na/releases).
 2. Extract its contents into `custom_components/toyota_na` in your Home Assistant
    configuration directory.
 3. Restart Home Assistant. For a new install, add **Toyota (North America)**

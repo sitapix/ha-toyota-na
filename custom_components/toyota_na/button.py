@@ -97,8 +97,14 @@ class ToyotaCommandButton(ToyotaButtonBase):
         vehicle = self.vehicle
         if vehicle is None:
             return
-        with translate_service_errors():
+        with translate_service_errors(on_uncertain=self._command_finished):
             await vehicle.send_command(self._command)
+        self._command_finished()
+
+    def _command_finished(self):
+        """Read cloud status after completion or an uncertain submission."""
+        # An attempted command may have woken the vehicle even without a callback.
+        # Record it so the coordinator does not add a scheduled vehicle wake.
         record_vehicle_wake(self.hass, self._config_entry, self.vin)
         self._schedule_refresh(self._command)
 

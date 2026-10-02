@@ -40,7 +40,7 @@ class CommandServiceErrorTests(unittest.IsolatedAsyncioTestCase):
             (self.lock.async_lock, (), "send_command"),
             (self.lock.async_unlock, (), "send_command"),
         ]
-        for service, operation in ((ha.lock_platform.DOOR_LOCK, "send_command"), ("refresh", "poll_vehicle_refresh")):
+        for service, operation in ((ha.lock_platform.DOOR_LOCK, "send_command"), ("engine_start", "send_command"), ("refresh", "poll_vehicle_refresh")):
             call = types.SimpleNamespace(service=service, data={"vehicle": "device"})
             self.actions.append((handlers[service], (call,), operation))
 

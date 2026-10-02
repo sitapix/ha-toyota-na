@@ -54,13 +54,13 @@ class RemoteRuntimeTests(unittest.IsolatedAsyncioTestCase):
             await vehicle.send_command(RemoteRequestCommand.ExtendRuntime)
         client.remote_request_24mm.assert_not_awaited()
 
-    async def test_timed_out_callback_reports_acceptance_without_claiming_completion(self):
+    async def test_timed_out_callback_reports_unknown_outcome(self):
         websocket = transport._WebSocket()
         with (
             patch.object(transport.patch_client.aiohttp, "ClientSession", return_value=transport._WebSocketSession(websocket)),
             patch.object(transport.patch_client, "_wait_for_remote_command_result", side_effect=TimeoutError),
         ):
-            with self.assertRaisesRegex(RuntimeError, "accepted.*did not report completion"):
+            with self.assertRaisesRegex(transport.patch_client.RemoteCommandOutcomeUnknown, "outcome is unknown"):
                 await transport.patch_client.remote_request_24mm(transport._CommandClient(), "TESTVIN24", "add-runtime")
 
     async def test_partial_read_data_survives_an_error_on_another_field(self):

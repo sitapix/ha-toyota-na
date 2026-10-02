@@ -9,11 +9,17 @@ from toyota_na.exceptions import AuthError
 
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 
+from .patch_client import RemoteCommandOutcomeUnknown
+
 
 @contextmanager
-def translate_service_errors():
+def translate_service_errors(*, on_uncertain=None):
     try:
         yield
+    except RemoteCommandOutcomeUnknown as err:
+        if on_uncertain is not None:
+            on_uncertain()
+        raise HomeAssistantError(str(err)) from err
     except json.JSONDecodeError as err:
         raise HomeAssistantError("Toyota returned an invalid response.") from err
     except ValueError as err:
