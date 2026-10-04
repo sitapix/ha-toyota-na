@@ -30,7 +30,8 @@ REMOTE_COMMAND_TIMEOUT = 60
 # A sleeping vehicle can take about two minutes to act on a command.
 VEHICLE_COMMAND_TIMEOUT = 180
 # Toyota's app wakes the vehicle on open and waits two seconds before a command.
-WAKE_SETTLE_SECONDS = 5
+WAKE_SETTLE_SECONDS = 2
+RECENT_WAKE_SECONDS = 30
 REMOTE_AUTOFIX_COMMANDS = ("door-lock", "power-window-close", "sunroof-close")
 AUTOFIX_REQUIRED = (
     "Toyota needs the RAV4 locked with its windows and moonroof closed before "
@@ -97,6 +98,13 @@ def remember_vehicle_generation(client, vin, generation):
 
 def _active_generation(client, vin):
     return (getattr(client, "_vehicle_generations", None) or {}).get(vin)
+
+
+def _record_recent_wake(client, vin):
+    if vin is not None:
+        if not hasattr(client, "_recent_vehicle_wakes"):
+            client._recent_vehicle_wakes = {}
+        client._recent_vehicle_wakes[vin] = time.monotonic()
 
 
 def _active_command_trace(client, vin):
@@ -1222,6 +1230,7 @@ async def wake_vehicles(self, region="US", vin=None, generation=None):
                 })
                 if resp.status < 400:
                     self._last_wake = {"at": datetime.now(timezone.utc).isoformat(), "attempts": results}
+                    _record_recent_wake(self, vin)
                     return
     self._last_wake = {"at": datetime.now(timezone.utc).isoformat(), "attempts": results}
     raise RuntimeError(
@@ -1233,6 +1242,13 @@ async def wake_vehicles(self, region="US", vin=None, generation=None):
 async def _pre_wake_for_command(self, vin, region):
     """Wake the telematics unit like Toyota's app; the command is sent either way."""
     trace = _active_command_trace(self, vin)
+    recent = getattr(self, "_recent_vehicle_wakes", {}).get(vin)
+    if recent is not None and 0 <= time.monotonic() - recent < RECENT_WAKE_SECONDS:
+        remaining = WAKE_SETTLE_SECONDS - (time.monotonic() - recent)
+        _trace_event(trace, "recent_wake_reused")
+        if remaining > 0:
+            await asyncio.sleep(remaining)
+        return
     try:
         await self.wake_vehicles(region, vin, _active_generation(self, vin))
     except (AuthError, asyncio.CancelledError):
@@ -1241,6 +1257,7 @@ async def _pre_wake_for_command(self, vin, region):
         _trace_event(trace, "pre_wake_failed")
         _LOGGER.debug("Wake before remote command failed: %s", type(err).__name__)
     else:
+        _record_recent_wake(self, vin)
         _trace_event(trace, "pre_wake_sent")
         await asyncio.sleep(WAKE_SETTLE_SECONDS)
 
@@ -1333,6 +1350,27 @@ async def _run_appsync_operation(
     self, vin, submit, region, *, fail_on_unknown=False, command=None, timeout=None,
     match_request_no=True,
 ):
+    if not hasattr(self, "_pending_remote_commands"):
+        self._pending_remote_commands = set()
+    key = (vin, command)
+    if command is not None and key in self._pending_remote_commands:
+        raise ValueError("This Toyota command is already in progress. Wait for it to finish.")
+    self._pending_remote_commands.add(key)
+    queued_at = time.monotonic()
+    try:
+        return await _run_serialized_appsync_operation(
+            self, vin, submit, region, fail_on_unknown=fail_on_unknown,
+            command=command, timeout=timeout, match_request_no=match_request_no,
+            queued_at=queued_at,
+        )
+    finally:
+        self._pending_remote_commands.discard(key)
+
+
+async def _run_serialized_appsync_operation(
+    self, vin, submit, region, *, fail_on_unknown, command, timeout,
+    match_request_no, queued_at,
+):
     # Callbacks can omit request numbers, so serialize this account's
     # operations for each vehicle.
     if not hasattr(self, "_remote_locks"):
@@ -1350,6 +1388,7 @@ async def _run_appsync_operation(
                 "immediate-charge", "resume-charge", "charge-stop", "power-supply-stop",
             ) else "other",
             "events": [],
+            "queue_seconds": round(time.monotonic() - queued_at, 3),
             "outcome": "pending",
         }
         self._remote_command_history.append(trace)
@@ -1364,9 +1403,11 @@ async def _run_appsync_operation(
             trace["outcome"] = "completed"
             return result
         except RemoteCommandOutcomeUnknown:
+            getattr(self, "_recent_vehicle_wakes", {}).pop(vin, None)
             trace["outcome"] = "unknown"
             raise
         except RemoteCommandRejected:
+            getattr(self, "_recent_vehicle_wakes", {}).pop(vin, None)
             trace["outcome"] = "rejected"
             raise
         except asyncio.CancelledError:

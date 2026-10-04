@@ -7,6 +7,7 @@ from homeassistant.components.lock import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
@@ -14,6 +15,7 @@ from toyota_na.vehicle.base_vehicle import ToyotaVehicle, VehicleFeatures
 from toyota_na.vehicle.entity_types.ToyotaLockableOpening import ToyotaLockableOpening
 
 from .base_entity import ToyotaNABaseEntity
+from .command_refresh import refresh_after_command
 from .const import (
     COMMAND_MAP,
     COMMAND_REFRESH_DELAY,
@@ -77,6 +79,7 @@ class ToyotaLock(ToyotaNABaseEntity, LockEntity):
         super().__init__(*args)
         self._config_entry = config_entry
         self._state_changing = False
+        self._pending_command = None
 
     @property
     def icon(self):
@@ -105,11 +108,11 @@ class ToyotaLock(ToyotaNABaseEntity, LockEntity):
 
     @property
     def is_locking(self):
-        return self._state_changing is True and self.is_locked is False
+        return self._state_changing and self._pending_command == DOOR_LOCK
 
     @property
     def is_unlocking(self):
-        return self._state_changing is True and self.is_locked is True
+        return self._state_changing and self._pending_command == DOOR_UNLOCK
 
     async def async_lock(self, **kwargs):
         """Lock all or specified locks. A code to lock the lock with may optionally be specified."""
@@ -121,19 +124,25 @@ class ToyotaLock(ToyotaNABaseEntity, LockEntity):
 
     async def toggle_lock(self, command: str):
         """Set the lock state via the provided command string."""
+        if self._state_changing:
+            raise ServiceValidationError("A lock command is already in progress. Wait for it to finish.")
         if self.vehicle is not None:
+            self._refresh_pending = False
+            self._pending_command = command
             self._state_changing = True
             self.async_write_ha_state()
             try:
                 with translate_service_errors(on_uncertain=self._schedule_command_refresh):
                     await self.vehicle.send_command(COMMAND_MAP[command])
             except (Exception, asyncio.CancelledError):
-                self._state_changing = False
-                self.async_write_ha_state()
+                if not self._refresh_pending:
+                    self._state_changing = False
+                    self.async_write_ha_state()
                 raise
             self._schedule_command_refresh()
 
     def _schedule_command_refresh(self):
+        self._refresh_pending = True
         record_vehicle_wake(self.hass, self._config_entry, self.vin)
         task = self.hass.async_create_task(self._background_refresh())
         self._config_entry.async_on_unload(task.cancel)
@@ -141,8 +150,10 @@ class ToyotaLock(ToyotaNABaseEntity, LockEntity):
     async def _background_refresh(self):
         """Refresh coordinator state after a remote command."""
         try:
-            await asyncio.sleep(COMMAND_REFRESH_DELAY)
-            await self.coordinator.async_request_refresh()
+            await refresh_after_command(
+                self.coordinator, self.vin, COMMAND_MAP[self._pending_command],
+                delay=COMMAND_REFRESH_DELAY,
+            )
         except Exception as err:  # noqa: BLE001
             _LOGGER.debug("Post-command refresh failed: %s", err)
         finally:
