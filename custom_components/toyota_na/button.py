@@ -1,8 +1,10 @@
+import asyncio
 from typing import Any, cast
 
 from homeassistant.components.button import ButtonEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
@@ -85,7 +87,12 @@ class ToyotaCommandButton(ToyotaButtonBase):
     ) -> None:
         super().__init__(*args)
         self._command = command
+        self._command_pending = False
         self._attr_icon = icon
+
+    @property
+    def extra_state_attributes(self):
+        return {"command_pending": self._command_pending}
 
     @property
     def available(self) -> bool:
@@ -101,14 +108,33 @@ class ToyotaCommandButton(ToyotaButtonBase):
         vehicle = self.vehicle
         if vehicle is None:
             return
-        with translate_service_errors(on_uncertain=self._command_finished):
-            await vehicle.send_command(self._command)
+        if self._command_pending:
+            raise ServiceValidationError("This Toyota command is already in progress. Wait for it to finish.")
+        self._refresh_pending = False
+        self._command_pending = True
+        self.async_write_ha_state()
+        try:
+            with translate_service_errors(on_uncertain=self._command_finished):
+                await vehicle.send_command(self._command)
+        except (Exception, asyncio.CancelledError):
+            if not self._refresh_pending:
+                self._command_pending = False
+                self.async_write_ha_state()
+            raise
         self._command_finished()
+
+    async def _async_refresh_after_delay(self, command=None):
+        try:
+            await super()._async_refresh_after_delay(command)
+        finally:
+            self._command_pending = False
+            self.async_write_ha_state()
 
     def _command_finished(self):
         """Read cloud status after completion or an uncertain submission."""
         # An attempted command may have woken the vehicle even without a callback.
         # Record it so the coordinator does not add a scheduled vehicle wake.
+        self._refresh_pending = True
         record_vehicle_wake(self.hass, self._config_entry, self.vin)
         self._schedule_refresh(self._command)
 

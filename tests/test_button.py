@@ -81,6 +81,9 @@ class Subscriptable:
 
 
 class CoordinatorEntity(Subscriptable):
+    def async_write_ha_state(self):
+        pass
+
     def __init__(self, coordinator):
         self.coordinator = coordinator
 
@@ -269,6 +272,9 @@ class FakeVehicle:
         self.supported = set(supported)
         self.sent = []
         self.refresh_requests = 0
+        self.status_reads = 0
+        self.region = "US"
+        self._client = types.SimpleNamespace(graphql_get_vehicle_status=self.read_status)
         self.features = {}
         self.electric = False
         self.backdoor_type = "trunk"
@@ -283,6 +289,13 @@ class FakeVehicle:
 
     @property
     def can_receive_status(self):
+        return True
+
+    async def read_status(self, *args):
+        self.status_reads += 1
+        return {"vehicleState": {"engine": {"running": True}}}
+
+    def apply_graphql_status(self, status):
         return True
 
     async def send_command(self, command):
@@ -325,6 +338,8 @@ class FakeEntityRegistry:
 class ButtonTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         button.COMMAND_REFRESH_DELAY = 0
+        from custom_components.toyota_na import command_refresh
+        self.enterContext(mock.patch.object(command_refresh, "APPSYNC_STATUS_INTERVAL", 0))
         lock_platform.COMMAND_REFRESH_DELAY = 0
         self.vehicle = FakeVehicle(
             {
@@ -380,7 +395,8 @@ class ButtonTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(self.vehicle.sent, [RemoteRequestCommand.EngineStart])
         self.assertEqual(self.vehicle.refresh_requests, 0)
-        self.assertEqual(self.coordinator.refreshes, 1)
+        self.assertEqual(self.coordinator.refreshes, 0)
+        self.assertEqual(self.vehicle.status_reads, 4)
         self.assertIn(LAST_WAKE_AT, self.config_entry.data)
         self.assertEqual(
             self.config_entry.data[LAST_VEHICLE_WAKES],
@@ -414,7 +430,8 @@ class ButtonTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(self.vehicle.sent, [RemoteRequestCommand.DoorLock])
         self.assertEqual(self.vehicle.refresh_requests, 0)
-        self.assertEqual(self.coordinator.refreshes, 1)
+        self.assertEqual(self.coordinator.refreshes, 0)
+        self.assertEqual(self.vehicle.status_reads, 4)
         self.assertIn(LAST_WAKE_AT, self.config_entry.data)
 
     def test_primary_lock_ignores_other_lockable_openings(self):

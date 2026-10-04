@@ -461,9 +461,11 @@ class UncertainServiceTests(services.CommandServiceErrorTests):
                 self.entry.data.clear()
                 self.hass.tasks.clear()
                 self.coordinator.refreshes = 0
+                self.vehicle.status_reads = 0
                 error = client.RemoteCommandOutcomeUnknown(client.REMOTE_COMMAND_UNKNOWN)
                 with (
                     patch.object(self.vehicle, operation, AsyncMock(side_effect=error)) as send,
+                    patch("custom_components.toyota_na.command_refresh.APPSYNC_STATUS_INTERVAL", 0),
                     patch.object(ha.button, "COMMAND_REFRESH_DELAY", 0),
                     patch.object(ha.lock_platform, "COMMAND_REFRESH_DELAY", 0),
                     patch.object(ha.integration_runtime, "COMMAND_REFRESH_DELAY", 0),
@@ -473,7 +475,8 @@ class UncertainServiceTests(services.CommandServiceErrorTests):
                     await asyncio.gather(*self.hass.tasks)
                 send.assert_awaited_once()
                 self.assertEqual(1, len(self.hass.tasks))
-                self.assertEqual(1, self.coordinator.refreshes)
+                self.assertEqual(0, self.coordinator.refreshes)
+                self.assertEqual(4, self.vehicle.status_reads)
                 self.assertEqual(0, self.vehicle.refresh_requests)
                 self.assertIn(ha.LAST_WAKE_AT, self.entry.data)
                 self.assertFalse(self.lock._state_changing)
